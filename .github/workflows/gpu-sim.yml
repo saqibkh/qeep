@@ -1,0 +1,106 @@
+name: CUDA on simulated H100
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# the CUDA tensor library and runs the Go tests that use the cuda build tag on
+# a simulated NVIDIA H100 (https://github.com/pantheongpu/pantheonsim). A
+# simulator cannot reproduce hardware-specific behavior or timing, so it
+# complements real-GPU testing and does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "tensor/internal/cudatensor/**"
+      - "tensor/tensor.go"
+      - "go.mod"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Go 1.26 randomizes the heap base address. The simulator then sometimes
+  # mistakes a host pointer for device memory and cudaMemcpy fails.
+  GOEXPERIMENT: norandomizedheapbase64
+
+jobs:
+  cuda-tests:
+    name: Go tests with cuda tag, simulated H100
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@656f502ef4782d94d34d8ddd368e333960609639 # v0.1.8
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # The simulator JIT-compiles PTX and needs a shared CUDA runtime, so the
+      # Makefile's nvcc line is patched on the runner (the repo is not changed).
+      - name: Build the CUDA library
+        run: |
+          sed -i 's/nvcc -Xcompiler/nvcc -cudart shared -arch=compute_90 -Xcompiler/' Makefile
+          make cuda
+          ls -l tensor/internal/cudatensor/lib/libcudatensor.so
+
+      # Test binaries are built normally and run under the simulator
+      - name: Build the tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/bins"
+          go list -tags cuda -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... > "$RUNNER_TEMP/pkgs"
+          cat "$RUNNER_TEMP/pkgs"
+          i=0
+          while read -r pkg; do
+            i=$((i+1))
+            go test -tags cuda -c -o "$RUNNER_TEMP/bins/t$i.test" \
+              -coverpkg=github.com/sahandsafizadeh/qeep/tensor/internal/cudatensor "$pkg"
+            echo "$pkg" > "$RUNNER_TEMP/bins/t$i.pkg"
+          done < "$RUNNER_TEMP/pkgs"
+
+      # Every package whose tests use RunTestLogicOnDevices also runs them on
+      # the CUDA device when built with the cuda tag. The coverage of the
+      # cudatensor package proves the device code really ran.
+      - name: Test on the simulated H100
+        run: |
+          fail=0
+          for t in "$RUNNER_TEMP"/bins/t*.test; do
+            b=${t%.test}
+            pkg=$(cat "$b.pkg")
+            echo "::group::$pkg"
+            dir=$(go list -tags cuda -f '{{.Dir}}' "$pkg")
+            ( cd "$dir" && vgpu run "$t" -test.v -test.coverprofile="$RUNNER_TEMP/$(basename "$b").cov" ) > "$b.log" 2>&1 || fail=1
+            tail -n 5 "$b.log"
+            echo "::endgroup::"
+          done
+          cat "$RUNNER_TEMP"/bins/t*.log | grep -E '^(--- FAIL|FAIL|panic)' || true
+          [ "$fail" = 0 ]
+
+      # Guard against a silent CPU fallback: no test may be skipped, enough
+      # tests must have run, and the merged coverage of the cudatensor package
+      # (the cgo wrappers around the CUDA kernels) must be high, which only
+      # happens if the device path really ran.
+      - name: Check that the device was used
+        run: |
+          if grep -h -E '^\s*--- SKIP' "$RUNNER_TEMP"/bins/t*.log; then
+            echo "tests were skipped"; exit 1
+          fi
+          passed=$(cat "$RUNNER_TEMP"/bins/t*.log | grep -c -E '^\s*--- PASS')
+          echo "passing tests and subtests: $passed"
+          [ "$passed" -gt 1000 ]
+          { echo "mode: set"; cat "$RUNNER_TEMP"/*.cov | grep -v '^mode:'; } > "$RUNNER_TEMP/all.cov"
+          cov=$(go tool cover -func="$RUNNER_TEMP/all.cov" | tail -n 1 | awk '{print $NF}' | tr -d '%')
+          echo "cudatensor coverage: $cov%"
+          awk -v c="$cov" 'BEGIN { exit !(c >= 90) }'
